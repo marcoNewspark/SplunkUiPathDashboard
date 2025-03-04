@@ -1,0 +1,54 @@
+index = "xxx" sourcetype="uiPath:execution"
+| eval temp_start_time=if(like(lower(Message), "%execution started%"), _time, null())
+| eval temp_end_time=if(like(lower(Message), "%execution ended%"), _time, null())
+| eval is_exception=if(like(lower(Message), "%system exception%"), _time, null())
+| eval is_transaction=if(like(Message, "Processing Transaction%"), 1, null())
+| stats 
+    values(temp_start_time) as job_start,
+    values(temp_end_time) as job_end,
+    latest(_time)  as last_message,
+    values(is_exception) as exception_time
+	count(eval(isnotnull(is_transaction))) as transaction_count
+    by JobId, ProcessName
+| eval start_time=min(job_start)
+| eval real_end=min(job_end)
+| eval last_message = last_message + 3600
+| eval inferred_end=if(now() - last_message > 7200, last_message, null())
+| eval end_time=coalesce(real_end, inferred_end)
+| eval local_start=start_time + 3600
+| eval local_end=if(isnotnull(end_time), end_time + 3601, null())
+| eval start_formatted=strftime(local_start, "%d-%m-%Y %H:%M:%S")
+| eval end_formatted=case(
+    isnotnull(real_end), strftime(local_end, "%d-%m-%Y %H:%M:%S"),
+    isnotnull(inferred_end), strftime(local_end, "%d-%m-%Y %H:%M:%S") + " (inferred)",
+    1==1, "Still Running"
+)
+| eval no_comms_time=round((now() - last_message)/60, 0) 
+| eval last_time_formatted = strftime(last_message, "%d-%m-%Y %H:%M:%S")
+| eval duration_minutes=if(isnotnull(end_time), 
+    round((end_time - start_time)/60, 0), 
+    round((now() - 3600 - start_time)/60, 0))
+| eval duration=printf("%02dh %02dm", floor(duration_minutes/60), duration_minutes%60)
+| eval status=case(
+    isnotnull(exception_time) and (isnotnull(real_end) or isnotnull(inferred_end)), "Completed with System Exception",
+    isnotnull(real_end), "Completed",
+    isnotnull(inferred_end), "Inferred End",
+	no_comms_time >= 30, "Running, no comms for 30+ minutes",
+    no_comms_time >= 20, "Running, no comms for 20 minutes",
+    no_comms_time >= 10, "Running, no comms for 10 minutes",
+    no_comms_time >= 5, "Running, no comms for 5 minutes",
+    1==1, "Running"
+)
+| eval range=case(
+    status=="System Exception", 100,
+    status=="Inferred End", 75,
+    status=="Running", 50,
+    status=="Running, no comms for 30+ minutes", 60,
+    status=="Running, no comms for 20 minutes", 55,
+    status=="Running, no comms for 10 minutes", 50,
+    status=="Running, no comms for 5 minutes", 45,
+    1==1, 25
+)
+|  where len(ProcessName) > 0 AND ProcessName != "OutlookDispatcher" 
+| table ProcessName start_formatted end_formatted duration status transaction_count 
+| sort -start_formatted
